@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+*.log
+npm-debug.log*
+
+# Env
+.env
+.env.*.local
+!.env.example
+
+# Local SQLite (Dev)
+*.sqlite
+*.sqlite3
+data/
+
+.DS_Store

@@ -128,7 +128,7 @@ src/Modules/User/Account/
 │   │   ├── UserAccountController.ts   Controller (nur HTTP-Belange)
 │   │   ├── Requests/                  Request-DTOs + Validierung → RegisterUserAccountRequest.ts
 │   │   └── Transformers/              Response-Formatierung → UserAccountResponse.ts
-│   ├── Console/                       CLI-Commands (nest-commander) → CreateAdminUserCommand.ts
+│   ├── Console/                       CLI-Commands (Seeder-Script) → CreateAdminUser.ts
 │   └── Jobs/                          UI-nahe Jobs + Listeners
 │
 ├── Tests/                            ← Modul-Tests (Unit + Feature)
@@ -157,6 +157,7 @@ src/Modules/User/Account/
 | Migrations      | TypeORM Migrations (inkrementell nachschiebbar) | **entschieden** |
 | Auth            | JWT (stateless) + Roles/Permissions-Guards | **entschieden** |
 | Validierung     | `class-validator` + `ValidationPipe` (DTOs) | **entschieden** |
+| API-Doku        | `@nestjs/swagger` (aus Code generiert), UI unter `/docs` | **entschieden** |
 | Architektur-Check | `dependency-cruiser` (Schicht-/Modul-Grenzen, CI) | **entschieden** |
 | Tests           | Jest (Unit + Feature) + `supertest` (HTTP) | **entschieden** |
 | Coverage         | CI-Coverage mit Threshold; **kein Feature ohne Tests** | **entschieden** |
@@ -176,20 +177,45 @@ src/Modules/User/Account/
 | Entity             | TypeORM-Entity (ActiveRecord, `extends BaseEntity`) |
 | Request-Validierung | DTO + `class-validator` (`ValidationPipe`) |
 | Response           | Response-DTO / Serializer |
-| CLI-Command        | `nest-commander` `Command` |
+| CLI-Command        | Standalone-Script (`NestFactory.createApplicationContext`) |
 | Permissions        | RBAC + `PermissionsGuard` + `@RequirePermission` |
 
 ## Auth & Permissions
 
 - **Stateless via JWT** — kein Server-Session-State → horizontal skalierbar.
-  Das Token trägt die Identität; Rollen/Permissions werden daraus aufgelöst.
-- **RBAC:** es gibt **Rollen** und **Permissions**; eine Rolle bündelt
-  Permissions.
+  Das Token trägt Identität, Rollen und die aufgelösten Permissions
+  (Momentaufnahme zum Login-Zeitpunkt).
+- **RBAC, DB-gestützt:** Tabellen `permissions` (Registry) und `roles`
+  (Rolle → Permission-Namen). Ein User hat **mehrere Rollen** möglich
+  (`UserAccount.roles: string[]`); der Resolver vereinigt deren Permissions.
 - **Routen-Schutz:** jede geschützte Route verlangt eine konkrete Permission
-  (Permission-Guard). Es gibt **public** Routen (z. B. Login, Health) und
-  **private** Routen (Guard erzwingt gültiges JWT + passende Permission).
-- Umsetzung in NestJS: `JwtAuthGuard` + `PermissionsGuard` +
-  `@RequirePermission('...')`-Decorator; `@Public()` markiert offene Routen.
+  über `@RequirePermission('...')`. `@Public()` markiert offene Routen (Login,
+  Registrierung). Guards: `JwtAuthGuard` (authentifiziert, secure-by-default) +
+  `PermissionsGuard` (autorisiert).
+- **Initialer Admin:** wird **beim Boot automatisch angelegt**, gesteuert über
+  `ADMIN_EMAIL` / `ADMIN_PASSWORD` (idempotent; ohne die Variablen passiert
+  nichts). Alternativ manuell via CLI: `npm run seed:admin -- <email> <password>`.
+
+### Permissions werden aus dem Code entdeckt (kein manueller Seeder)
+
+Permissions werden **ausschließlich an den Routen deklariert** und beim Boot
+automatisch übernommen:
+
+1. **Discovery:** `PermissionDiscoveryService` scannt via NestJS
+   `DiscoveryService` alle Controller-Routen und sammelt die
+   `@RequirePermission(...)`-Metadaten ein — das ist die einzige Quelle.
+2. **Boot-Seeder:** `PermissionSynchronizer` (`OnApplicationBootstrap`)
+   schreibt **fehlende** Permissions in die `permissions`-Tabelle nach
+   (idempotent, sicher bei jedem Deploy/Boot).
+3. **Admin automatisch:** die `admin`-Rolle bekommt **alle** Permissions
+   zugeordnet. Neues Modul → neue Route-Permissions → beim Boot automatisch in
+   der Tabelle **und** bei Admin.
+4. **Login:** `PermissionResolver` (Port) löst die Rollen des Users in
+   Permissions auf; diese landen im JWT.
+
+Der Mechanismus liegt in `Shared/Authorization` (Querschnitt, den jedes Modul
+über die Guards nutzt). Login/Guards hängen nur am **Port `PermissionResolver`**,
+nicht an der konkreten DB-Implementierung — s. [Ausblick](#ausblick).
 
 ## API-Konventionen
 
@@ -201,13 +227,23 @@ src/Modules/User/Account/
   werden dort auf HTTP-Status gemappt.
 - **Responses** über explizite Response-DTOs / Serializer — keine ORM-Models
   direkt ausliefern.
+- **API-Doku** via `@nestjs/swagger` — **aus dem Code generiert** (Swagger-CLI-
+  Plugin liest Typen + `class-validator`-Decorators), interaktive UI unter
+  `/docs`, OpenAPI-JSON unter `/docs-json`. Bearer-Auth-Button integriert.
 
 ## Shared-Module
 
-Querschnitts-Code lebt in geteilten Modulen (nicht in fachlichen Modulen
-dupliziert): Base-Entity, CQRS-Bus-Setup, Guards (JWT/Permissions),
-Exception-Filter, Pagination, Response-Envelope. Genauer Zuschnitt beim
-Scaffolding.
+Querschnitts-Code lebt unter `src/Shared/` (nicht in Fachmodulen dupliziert):
+
+- `Shared/Domain/` — `DomainException` (Basis für fachliche Exceptions).
+- `Shared/Http/Filters/` — `GlobalExceptionFilter` (einheitliches Fehler-Format).
+- `Shared/Auth/` — JWT-Authentifizierung: `JwtStrategy`, `JwtAuthGuard`,
+  `PermissionsGuard`, Decorators (`@Public`, `@RequirePermission`, `@CurrentUser`).
+- `Shared/Authorization/` — Autorisierung: Permission-Discovery, Boot-Seeder,
+  DB-Resolver, `Role`/`Permission`-Entities (s. [Auth & Permissions](#auth--permissions)).
+
+`SharedModule` ist `@Global` und stellt Validierung (`ValidationPipe`),
+Fehler-Filter und die Auth/Authorization-Provider modulweit bereit.
 
 ## Tests & Coverage
 
@@ -242,8 +278,11 @@ Scaffolding.
 - **Tests:** Jest — Unit + Feature je Modul (`Tests/`), Coverage-Threshold in
   CI. **Kein Feature ohne Tests** (Definition of Done).
 - **Architektur-Check:** `dependency-cruiser` erzwingt Schicht-/Modul-Grenzen in CI.
-- **Auth:** JWT (stateless), RBAC mit Rollen + Permissions, Public- vs.
-  Permission-Guard-Routen.
+- **Auth:** JWT (stateless), DB-gestütztes RBAC mit Rollen + Permissions;
+  Permissions werden aus den Route-Metadaten **automatisch entdeckt** und beim
+  Boot geseedet, Admin bekommt alle. Public- vs. Permission-Guard-Routen.
+- **IDs:** UUID v4 (GUID), app-seitig via `crypto.randomUUID()` erzeugt,
+  gespeichert als `varchar(36)` — portabel über SQLite/Postgres.
 - **API:** REST unter `/api/v1`, `class-validator`, einheitliches Fehler-Format,
   Response-DTOs.
 - **Dev-Datenbank:** SQLite (Zero-Config) für lokale Entwicklung + Migrations.
@@ -254,23 +293,49 @@ Scaffolding.
   (`Infrastructure/Jobs`).
 - **Referenz-Modul:** `User`/`Account` als lauffähige Blaupause.
 
-## Offene Fragen
+## Status
 
-1. **Shared-Module-Zuschnitt:** genaue Aufteilung des geteilten Kerns
-   (Base-Entity, Guards, Filter, Pagination …) — aktuell noch offen, wird beim
-   Scaffolding festgezurrt.
+Das Grundgerüst steht und ist verifiziert (Build, `dependency-cruiser`, Lint,
+19 Tests inkl. Coverage-Threshold, Migrations-CLI):
 
-## Nächste Schritte
+- Referenz-Modul **User/Account** (Domain/Application/Infrastructure/UI) mit
+  Registrierung, Login (JWT) und geschütztem Lesezugriff.
+- Auto-Permission-System (Discovery + Boot-Seeder + DB-Resolver) und
+  **automatischer Admin-Seed beim Boot** (per env).
+- **Swagger/OpenAPI** aus dem Code generiert, UI unter `/docs`.
+- TypeORM mit SQLite-Dev / Postgres-Prod, zwei Migrations, `@nestjs/cqrs`,
+  globale Validierung + Fehler-Filter, `dependency-cruiser`, Docker, CI.
 
-1. NestJS-Projekt aufsetzen (`src/`-Layout, TypeScript, ESLint/Prettier,
-   `.env`, `.dependency-cruiser.js`).
-2. TypeORM (SQLite-Dev / Postgres-Prod) + `@nestjs/cqrs` einbinden, DB-Config
-   per env, Migrations-Setup.
-3. JWT-Auth + Roles/Permissions-Guards, globale `ValidationPipe` &
-   Exception-Filter.
-4. Shared-Modul (Base-Entity, CQRS-Setup, Guards, Filter, Pagination).
-5. Referenz-Modul **User/Account** nach obiger Struktur anlegen
-   (Domain/Application/Infrastructure/UI) als lauffähige Blaupause.
-6. Test-Setup: Jest + `supertest`, `Tests/Unit` + `Tests/Feature` im
-   Referenz-Modul, Coverage-Threshold in CI.
-7. Root-Dateien: `Dockerfile`, `docker-compose.yml`, CI-Pipeline.
+## Setup & Commands
+
+```bash
+npm install
+cp .env.example .env          # ADMIN_EMAIL/ADMIN_PASSWORD → Auto-Admin beim Boot
+npm run migration:run         # Schema anlegen (Dev: dev.sqlite)
+npm run start:dev             # API: http://localhost:3000/api/v1  ·  Docs: /docs
+
+npm test                      # Unit + Feature
+npm run test:cov              # mit Coverage-Threshold
+npm run lint
+npm run depcruise             # Architektur-Regeln
+npm run build
+npm run seed:admin -- <email> <password>   # optional: Admin manuell anlegen
+```
+
+**API-Doku:** interaktive Swagger-UI unter `http://localhost:3000/docs`
+(OpenAPI-JSON: `/docs-json`).
+
+Ausgewählte Endpunkte: `POST /api/v1/accounts` (public, Registrierung),
+`POST /api/v1/auth/login` (public), `GET /api/v1/auth/me` (auth),
+`GET /api/v1/accounts/:id` (Permission `user-account:read`).
+
+## Ausblick
+
+- **Rollen/Permissions als eigenes Modul** (z. B. `Modules/Access`): Rollen
+  anlegen/ändern/löschen, Permissions Rollen zuweisen, Rollen an User. Der Umbau
+  ist sauber, weil Login/Guards nur am Port `PermissionResolver` hängen — das
+  Access-Modul liefert dann Implementierung + CRUD und übernimmt die
+  `Role`/`Permission`-Entities; `Shared` behält nur den Vertrag.
+- **Queue/Worker** (BullMQ) bei Bedarf — Andockpunkt `Infrastructure/Jobs`.
+- **Native `uuid`-Spalte auf Postgres** (statt `varchar(36)`) — optional,
+  treiberabhängig, falls gewünscht.
